@@ -1,0 +1,68 @@
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3841,6 +3841,7 @@
+ int32_t llama_mtp_draft(
+         llama_context * ctx,
+         const llama_token seed_token,
++        llama_token * out_drafts,        // size K
+         float * out_logits_last) {
+     // CURRENT: runs one MTP head forward, returns logits for the +1 position.
+     //
+@@ -3850,8 +3851,35 @@
+     //     const int K = max(1, atoi(s));
+     //     for (int k = 0; k < K; ++k) {
+     //         ctx->cparams.mtp_head_idx = k;
+-    //         // feed seed for k=0, else feed out_drafts[k-1]
++    //         const llama_token tok_in = (k == 0) ? seed_token : out_drafts[k-1];
+     //         build_and_compute_mtp_graph(ctx, tok_in, shared_h_t);
+-    //         out_drafts[k] = argmax(logits);
++    //         out_drafts[k] = sample_argmax(ctx->logits);
+     //     }
++    //
++    // shared_h_t is captured ONCE from the most recent main forward pass
++    // (already stored as `res->t_mtp_prev_hidden_in` via the existing
++    // hidden-state hook introduced in commit 987541157).
++    //
++    // Each head has its own self-attn KV cache. The caches are independent
++    // and must be rolled back on misprediction (same rollback code path as
++    // the existing T=N verify — just operates on N caches instead of 1).
++
++    const char * s = std::getenv("MTP_NUM_HEADS");
++    const int K = (s ? std::max(1, atoi(s)) : 1);
++
++    // Capture shared hidden once.
++    ggml_tensor * shared_h = ctx->get_last_mtp_prev_hidden();
++
++    llama_token prev = seed_token;
++    for (int k = 0; k < K; ++k) {
++        ctx->cparams.mtp_head_idx = k;
++        mtp_graph_compute(ctx, prev, shared_h);   // existing helper, unchanged internals
++        const llama_token tk = sample_argmax_from_ctx_logits(ctx);
++        out_drafts[k] = tk;
++        prev = tk;
++    }
++    // out_logits_last holds logits of head K-1 for caller's perturbation/stats.
++    copy_last_logits(ctx, out_logits_last);
++
++    return K;
+ }
+
+// ---- Verify path (unchanged) ----
+// After drafting K tokens, the existing verify path constructs
+// [seed, draft_1, draft_2, ..., draft_K] and calls llama_decode with T=K+1.
+// The main model's logits at position i must match draft_i for accept.
+// First mismatch wins + bonus token from position where mismatch occurred.
+// This is EXACTLY the current verify code — no changes needed.
+
+// ---- Rollback ----
+// On misprediction, the K head KV caches must be trimmed back to pre-draft.
+// Add per-head cache snapshotting analogous to the existing main-cache
+// rollback in src/llama-context.cpp around the `ckpt` save/restore logic.
+
+// ---- Cost model (at N=4) ----
+//   main_fwd = 56 ms (measured, plain decode)
+//   head_fwd = 12 ms (TARGET — must validate in Phase 0)
+//   per-pos acceptance p = 0.7 (TARGET)
+//   cycle_time  = 56 + 4*12 = 104 ms
+//   committed   = 1 + p + p^2 + p^3 + p^4 = 2.77
+//   throughput  = 26.6 tok/s  (1.49x over 17.9)

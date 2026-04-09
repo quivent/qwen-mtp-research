@@ -1,0 +1,44 @@
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -5523,7 +5523,13 @@
+                         // NextN/MTP tensors — now supports multiple heads.
+                         // Previously: hparams.nextn_predict_layers was always 1.
+                         // Now: each i in [n_layer - N, n_layer) holds an independent head_k
+                         //      where k = i - (n_layer - N). head_0 predicts +1, head_1 predicts +2, ...
+                         if (hparams.nextn_predict_layers > 0 && static_cast<uint32_t>(i) >= n_layer - hparams.nextn_predict_layers) {
+                             layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), { 2 * n_embd, n_embd }, flags);
+                             layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM, "weight", i), { n_embd }, flags);
+                             layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM, "weight", i), { n_embd }, flags);
++                            // NEW: tag this layer with its per-position offset k so the graph
++                            // builder and draft dispatcher can look it up by k, not by absolute il.
++                            layer.nextn.head_offset      = (int) (i - (n_layer - hparams.nextn_predict_layers));
+                             // Optional dedicated LM head for this offset. When mtp_use_dedicated_embeddings
+                             // is false (Qwen3.5 default) these will be absent and the head reuses
+                             // the main output projection.
+                             layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS, "weight", i), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
+                             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
+                             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd }, flags | TENSOR_NOT_REQUIRED);
+                         }
+
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -XXX,6 +XXX,9 @@
+ struct llama_layer_nextn {
+     struct ggml_tensor * eh_proj          = nullptr;
+     struct ggml_tensor * enorm            = nullptr;
+     struct ggml_tensor * hnorm            = nullptr;
+     struct ggml_tensor * embed_tokens     = nullptr;
+     struct ggml_tensor * shared_head_head = nullptr;
+     struct ggml_tensor * shared_head_norm = nullptr;
++    // Per-position offset (0 = predicts t+1, 1 = predicts t+2, ...).
++    // Set by loader when nextn_predict_layers > 1.
++    int head_offset = 0;
+ };
+
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -XXX,6 +XXX,8 @@
+ // LLM_KV_NEXTN_PREDICT_LAYERS is already registered; no arch change needed.
+ // The loader already reads it generically — the only question is whether
+ // any model-specific code path hardcoded `if (nextn_predict_layers == 1)`.
+ // grep confirms: none do. hparams.nextn_predict_layers is used as a count.

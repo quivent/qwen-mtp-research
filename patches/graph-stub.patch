@@ -1,0 +1,58 @@
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -17,7 +17,8 @@
+     // MTP draft graph: skip the full forward pass and run only the NextN
+     // (MTP) head over a single seed token plus the previous hidden state.
+     //
+-    // llama_context::mtp_graph_compute via res->t_mtp_prev_hidden_in.
++    // When MTP_NUM_HEADS > 1, dispatch to head_k based on an additional
++    // cparams field `mtp_head_idx` (set by the draft loop before each call).
+     if (gtype == LLM_GRAPH_TYPE_MTP) {
+         GGML_ASSERT(hparams.nextn_predict_layers > 0 && "MTP graph requested but model has no NextN layers");
+         GGML_ASSERT(ubatch.n_tokens == 1 && "MTP graph expects a single seed token per dispatch");
+@@ -45,10 +46,16 @@
+             ggml_set_name(inp_attn_nc->get_kq_mask(), "mtp_kq_mask_cnv");
+         }
+
+-        const int il_mtp = (int) (n_layer - hparams.nextn_predict_layers);
++        // Pick head_k by offset. head_offset 0 lives at n_layer - N,
++        // offset 1 at n_layer - N + 1, etc.
++        const int k = cparams.mtp_head_idx;  // 0..N-1
++        GGML_ASSERT(k >= 0 && (uint32_t)k < hparams.nextn_predict_layers);
++        const int il_mtp = (int) (n_layer - hparams.nextn_predict_layers + k);
+
+         ggml_tensor * mtp_logits = build_mtp_head(inp_attn_nc, prev_hidden, tok_embed, il_mtp, nullptr);
+         cb(mtp_logits, "result_output", -1);
+         res->t_logits = mtp_logits;
+
+         ggml_build_forward_expand(gf, mtp_logits);
+         return res;
+     }
+
+@@ -476,7 +483,8 @@
+ ggml_tensor * llm_build_qwen35::build_mtp_head(
+                   ...,
+                   int  il_mtp,
+                   ...) {
+-    // build_mtp_head reads model.layers[il_mtp].nextn.* — already parameterised by il,
+-    // so no change to this function body is needed for N > 1.
++    // build_mtp_head already reads model.layers[il_mtp].nextn.* —
++    // unchanged. All per-head divergence flows through `il_mtp`.
+     ...
+ }
+
+--- a/include/llama.h (or src/llama-cparams.h)
++++ b/include/llama.h
+@@ -XXX,6 +XXX,9 @@
+ struct llama_cparams {
+     ...
++    // Which MTP head to use on the next LLM_GRAPH_TYPE_MTP dispatch.
++    // Set by llama_mtp_draft() between each head_k call. Ignored if
++    // nextn_predict_layers <= 1.
++    int mtp_head_idx = 0;
+ };
+
+// ENV VAR GATE:
+// MTP_NUM_HEADS=4  -> llama_mtp_draft runs heads 0..3 sequentially
+// MTP_NUM_HEADS=1  -> legacy single-head behavior (current K=1 path)
+// unset            -> legacy single-head

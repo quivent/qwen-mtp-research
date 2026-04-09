@@ -68,11 +68,29 @@ The MTP draft pass costs about as much as a main forward pass on this model, so 
 1. Make the draft pass cheaper (prune the head, distill, etc.)
 2. **Per-position heads** — multiple cheap heads, each predicting +1, +2, ... +N from the same hidden state — so one main forward pass amortizes over N committed tokens. This is the DeepSeek V3 design and likely how the user's MLX implementation hits 1.68×.
 
-## Per-position MTP heads — design
+## ⚡ The MLX truth (the most important finding in this repo)
 
-See [docs/per-position-heads.md](docs/per-position-heads.md) for the full design. Headlines:
+The MLX implementation that hits **1.68× over baseline on Qwen3.5-27B** is **NOT per-position trained heads**. The MLX checkpoint contains exactly **one** MTP block — the same single head this llama.cpp port uses. The 1.68× comes from a runtime strategy in `stacked_v2.py`:
+
+1. **Chained recurrent application of the single MTP head** — feed the head's own output back as the next seed, multiple times per cycle
+2. **A small (~0.8B) companion draft model** running alongside the main model
+3. **Confidence gating** to stop chaining when the head loses confidence
+4. **Zero training cost**
+
+In other words: **the win is orchestration, not architecture.** The same single MTP head can deliver the speedup if you wire it differently. See [docs/mlx-reference.md](docs/mlx-reference.md) for the source-trace.
+
+This is the highest-leverage next move for the llama.cpp port: replicate the chained-recurrent approach, then add a 0.8B companion. No GPU spend required.
+
+## Per-position MTP heads — design (alternative path)
+
+If the chained approach doesn't deliver, [docs/per-position-heads.md](docs/per-position-heads.md) is the full DeepSeek V3 style design. **But there's a hard prerequisite gate** before any training spend:
+
+> **Phase 0 instrumentation**: measure the wall time of `build_mtp_head` on this hybrid model. If `head_fwd ≈ main_fwd` (which is likely given current K=1 spec runs at 0.43× of plain), per-position heads CANNOT win regardless of accept rate. The fixed overhead per draft pass (KV bookkeeping, DeltaNet state, graph alloc) is the dominant cost, not the FLOPs of the head's own block. Phase 0 is a kill-or-proceed gate.
+
+Headlines if Phase 0 passes:
 
 - **N=4 heads**, each a single transformer block, sharing the main model's embedding and LM head
+- **Estimated cost**: ~$165 in Lambda H100 time (Phase 1 data + Phase 2 training)
 - **Tensor naming**: `blk.<64+k>.nextn.*` for k=0..3, slotted into the existing GGUF layer table
 - **Training**: warm-start each head from the existing single MTP layer's weights, freeze the main model, train heads jointly with summed cross-entropy at offsets +1..+4 on a 1B-token corpus
 - **Inference math**: 1 main forward (60ms) + 4 head forwards (4×10ms) = 100ms per cycle, commits up to 4 tokens → theoretical 40 tok/s vs plain 17.9 tok/s = **2.23× speedup ceiling**
