@@ -64,6 +64,36 @@ The algorithmic parity is established. The remaining gap is two-fold:
 
 Closing the per-pass overhead gap is the higher-leverage next move. The 0.8B adds maybe another 1.2× on top once the per-pass cost is brought down.
 
+### Specific per-pass costs identified
+
+After looking inside `llama_context::mtp_graph_compute` (`src/llama-context.cpp:3667`):
+
+1. **Graph is rebuilt on every MTP draft call.** Line 3740 calls `model.build_graph(gparams)` each time, followed by `ggml_backend_sched_reset` and `ggml_backend_sched_alloc_graph`. For 24 draft calls over 64 tokens, that's 24 graph rebuilds. The MTP graph is tiny (1 layer, T=1) and its shapes are identical across calls, so this rebuild work is pure overhead. **Fix: cache the built graph at context init, have the draft call only set inputs and dispatch compute.**
+
+2. **Rollback re-decode is unfuseable with next verify.** On full rejection (`n_accepted == 0`), the rollback path does 2 forward passes to commit 1 token: verify `[id_last, d0, d1]` (fails), then re-decode `[id_last, corr]` (commit). The natural fuse — "next iteration's verify batch starts with `[id_last, corr, new_d0, new_d1]` after restore" — fails because the next draft call needs the main-model hidden at the position *after* `corr`, which only exists after the re-decode. DeltaNet's irreversibility blocks shortcuts. **Fix requires either: (a) graph-level modification to extract intermediate hiddens from the failing verify, or (b) adding an MTP head branch to the main decode graph so every main verify produces its own next draft for free.**
+
+3. **Attempted: `MTP_SKIP_ROLLBACK`.** An experiment in this session skipped the rollback re-decode entirely and just forced the recurrent position metadata forward via `llama_memory_seq_force_recurrent_pos`. Result: output drift (small but visible — wrong phrase substitutions like "planet to the Sun and the Sun") AND throughput stayed flat because the contamination increased the reject rate on subsequent iterations, cancelling the savings. Rejected as a dead end on Qwen3.5-27B.
+
+### The theoretical ceiling with the current approach
+
+Per-pass cost breakdown for a 64-token run (K=2, thresh=0.85, 78% accept, 8 rollbacks):
+
+```
+  1 main verify  × 34 = ~3400ms  (T=1 to T=3 mix, ~100ms avg on quiet GPU)
+  1 MTP draft    × 24 =  ~720ms  (~30ms each incl. graph rebuild overhead)
+  snapshot/restore × 8 =   ~80ms
+  ─────────────────────────────
+  total wall time   ≈   4200ms  →  15.2 tok/s
+```
+
+Matches observed (14.8 tok/s on quiet GPU). To get above plain decode (17.9 tok/s), we need to cut at least ~400ms out of the main-verify path or the draft path. The most tractable wins:
+
+- **Graph caching for MTP draft**: -200 to -300ms → ~16.5 tok/s
+- **MTP fused into main decode graph** (every verify outputs its own next draft): -720ms → **19.8 tok/s** (crosses plain decode)
+- **0.8B companion adding +1 committed token per cycle on successful verifies**: multiplicative win on top
+
+The fused-main-decode approach is the DeepSeek V3 style architecture done at inference time without training. It requires modifying `src/models/qwen35.cpp::build_graph` to add an MTP head output branch conditional on a `cparams.draft_mtp_inline` flag. That's the next real lever.
+
 ## Why this finding was buried for the entire session
 
 The chained recurrent threading at `src/llama-context.cpp:4180` was added in commit `987541157` (the in-graph AR loop work). The confidence gate at line 4140 was added in commit `7ac89131e` (the adaptive chain patch). Both landed early in the session. **Neither was ever measured against the post-fix bug** — the cache-bookkeeping bug was masking all output, so every measurement of these env vars produced "speedups" on broken text and the variants were marked as ineffective.
