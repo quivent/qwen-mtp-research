@@ -260,10 +260,15 @@ footer {
       <div class="metric-value">17.90<span class="metric-unit">tok/s</span></div>
       <div class="metric-note">Qwen3.5-27B Q4_K_M, M4 Max</div>
     </div>
+    <div class="metric good">
+      <div class="metric-label">Chained MTP (the recipe)</div>
+      <div class="metric-value">13.98<span class="metric-unit">tok/s</span></div>
+      <div class="metric-note">1.99× over K=1 · 0.78× of plain · coherent ✓</div>
+    </div>
     <div class="metric warn">
-      <div class="metric-label">K=1 MTP spec (this branch)</div>
-      <div class="metric-value">7.64<span class="metric-unit">tok/s</span></div>
-      <div class="metric-note">0.43× of plain decode · output validates ✓</div>
+      <div class="metric-label">K=1 MTP spec (vanilla)</div>
+      <div class="metric-value">7.02<span class="metric-unit">tok/s</span></div>
+      <div class="metric-note">post-bug-fix baseline · 5-prompt mean</div>
     </div>
     <div class="metric">
       <div class="metric-label">Patches in this series</div>

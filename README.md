@@ -68,18 +68,26 @@ The MTP draft pass costs about as much as a main forward pass on this model, so 
 1. Make the draft pass cheaper (prune the head, distill, etc.)
 2. **Per-position heads** — multiple cheap heads, each predicting +1, +2, ... +N from the same hidden state — so one main forward pass amortizes over N committed tokens. This is the DeepSeek V3 design and likely how the user's MLX implementation hits 1.68×.
 
-## ⚡ The MLX truth (the most important finding in this repo)
+## ⚡ The MLX truth — and the recipe that delivered 1.99× in llama.cpp
 
 The MLX implementation that hits **1.68× over baseline on Qwen3.5-27B** is **NOT per-position trained heads**. The MLX checkpoint contains exactly **one** MTP block — the same single head this llama.cpp port uses. The 1.68× comes from a runtime strategy in `stacked_v2.py`:
 
-1. **Chained recurrent application of the single MTP head** — feed the head's own output back as the next seed, multiple times per cycle
+1. **Chained recurrent application of the single MTP head** — feed the head's own output hidden as the next step's `prev_hidden`
 2. **A small (~0.8B) companion draft model** running alongside the main model
 3. **Confidence gating** to stop chaining when the head loses confidence
 4. **Zero training cost**
 
-In other words: **the win is orchestration, not architecture.** The same single MTP head can deliver the speedup if you wire it differently. See [docs/mlx-reference.md](docs/mlx-reference.md) for the source-trace.
+**Status in llama.cpp port (post-bug-fix)**: components 1 and 3 are wired and **deliver 1.99× over K=1 vanilla** with two environment variables. See [docs/the-recipe.md](docs/the-recipe.md).
 
-This is the highest-leverage next move for the llama.cpp port: replicate the chained-recurrent approach, then add a 0.8B companion. No GPU spend required.
+```bash
+MTP_CHAIN_KMAX=2 MTP_CHAIN_THRESH=0.85 \
+    ./build/bin/llama-mtp-speculative -m qwen3.5-27b-q4km.gguf \
+    -p "Explain photosynthesis." -n 64 -ngl 99
+```
+
+5-prompt mean: K=1 vanilla 7.02 tok/s → chained recipe 13.98 tok/s = **1.99×**, output coherent. **0.78× of plain decode (17.90 tok/s)** — closer than ever, but not yet over the line. The remaining gap is per-forward-pass overhead in llama.cpp (graph alloc, snapshot/restore, KV bookkeeping), not algorithm. The 0.8B companion (#2 above) is the next ~hour of work and adds another estimated 1.2× on top.
+
+**The lesson**: this recipe was sitting in the codebase the entire session. Both the chained-recurrent threading and the confidence gate were committed early on, but the cache-bookkeeping bug was making every measurement look like noise. After finding a bug that affects measurement, **re-run every experiment that was previously dismissed as ineffective**.
 
 ## Per-position MTP heads — design (alternative path)
 
